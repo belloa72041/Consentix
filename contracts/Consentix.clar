@@ -11,7 +11,11 @@
 (define-constant ERR_INVALID_TEMPLATE (err u109))
 (define-constant ERR_BATCH_LIMIT_EXCEEDED (err u110))
 (define-constant ERR_BATCH_OPERATION_FAILED (err u111))
+(define-constant ERR_AUDIT_LOG_FULL (err u112))
+(define-constant ERR_INVALID_EVENT_TYPE (err u113))
+(define-constant ERR_AUDIT_NOT_FOUND (err u114))
 (define-constant MAX_BATCH_SIZE u50)
+(define-constant MAX_AUDIT_LOGS_PER_USER u1000)
 
 (define-map consents
   { grantor: principal, grantee: principal, resource-id: (string-ascii 64) }
@@ -38,6 +42,7 @@
 (define-data-var total-consents uint u0)
 (define-data-var contract-paused bool false)
 (define-data-var template-count uint u0)
+(define-data-var audit-log-counter uint u0)
 
 (define-map consent-templates
   (string-ascii 64)
@@ -72,6 +77,104 @@
   }
 )
 
+(define-map audit-logs
+  uint
+  {
+    event-type: (string-ascii 32),
+    actor: principal,
+    target: (optional principal),
+    resource-id: (optional (string-ascii 64)),
+    timestamp: uint,
+    block-height: uint,
+    success: bool,
+    details: (string-ascii 256),
+    transaction-hash: (optional (buff 32))
+  }
+)
+
+(define-map user-audit-logs
+  principal
+  {
+    log-count: uint,
+    latest-log-id: uint,
+    logs: (list 100 uint)
+  }
+)
+
+(define-map consent-audit-trail
+  { grantor: principal, grantee: principal, resource-id: (string-ascii 64) }
+  {
+    creation-log-id: uint,
+    modification-count: uint,
+    last-modification-log-id: uint,
+    is-revoked: bool,
+    revocation-log-id: (optional uint)
+  }
+)
+
+(define-map event-type-stats
+  (string-ascii 32)
+  {
+    total-events: uint,
+    success-count: uint,
+    failure-count: uint,
+    last-event-timestamp: uint
+  }
+)
+
+(define-private (log-audit-event
+  (event-type (string-ascii 32))
+  (actor principal)
+  (target (optional principal))
+  (resource-id (optional (string-ascii 64)))
+  (success bool)
+  (details (string-ascii 256)))
+  (let (
+    (log-id (+ (var-get audit-log-counter) u1))
+    (current-timestamp stacks-block-height)
+    (user-logs (default-to { log-count: u0, latest-log-id: u0, logs: (list) } 
+               (map-get? user-audit-logs actor)))
+    (existing-stats (default-to { total-events: u0, success-count: u0, failure-count: u0, last-event-timestamp: u0 }
+                     (map-get? event-type-stats event-type)))
+  )
+    (var-set audit-log-counter log-id)
+    
+    (map-set audit-logs log-id {
+      event-type: event-type,
+      actor: actor,
+      target: target,
+      resource-id: resource-id,
+      timestamp: current-timestamp,
+      block-height: current-timestamp,
+      success: success,
+      details: details,
+      transaction-hash: none
+    })
+    
+    (if (< (get log-count user-logs) MAX_AUDIT_LOGS_PER_USER)
+      (map-set user-audit-logs actor {
+        log-count: (+ (get log-count user-logs) u1),
+        latest-log-id: log-id,
+        logs: (unwrap-panic (as-max-len? (append (get logs user-logs) log-id) u100))
+      })
+      (map-set user-audit-logs actor {
+        log-count: (get log-count user-logs),
+        latest-log-id: log-id,
+        logs: (unwrap-panic (as-max-len? (append (default-to (list) (slice? (get logs user-logs) u1 u100)) log-id) u100))
+      })
+    )
+    
+    (map-set event-type-stats event-type {
+      total-events: (+ (get total-events existing-stats) u1),
+      success-count: (if success (+ (get success-count existing-stats) u1) (get success-count existing-stats)),
+      failure-count: (if success (get failure-count existing-stats) (+ (get failure-count existing-stats) u1)),
+      last-event-timestamp: current-timestamp
+    })
+    
+    log-id
+  )
+)
+
 (define-public (grant-consent 
   (grantee principal) 
   (resource-id (string-ascii 64)) 
@@ -88,19 +191,32 @@
     (asserts! (not (is-eq tx-sender grantee)) ERR_INVALID_PRINCIPAL)
     (asserts! (is-none (map-get? consents consent-key)) ERR_ALREADY_EXISTS)
     
-    (map-set consents consent-key {
-      granted-at: current-block,
-      expires-at: expiry-block,
-      is-active: true,
-      permissions: permissions,
-      metadata: metadata
-    })
-    
-    (map-set user-consent-count grantee 
-      (+ (default-to u0 (map-get? user-consent-count grantee)) u1))
-    
-    (var-set total-consents (+ (var-get total-consents) u1))
-    (ok true)
+    (let (
+      (log-id (log-audit-event "GRANT_CONSENT" tx-sender (some grantee) (some resource-id) true 
+                              (concat "Granted consent for resource: " resource-id)))
+    )
+      (map-set consents consent-key {
+        granted-at: current-block,
+        expires-at: expiry-block,
+        is-active: true,
+        permissions: permissions,
+        metadata: metadata
+      })
+      
+      (map-set consent-audit-trail consent-key {
+        creation-log-id: log-id,
+        modification-count: u0,
+        last-modification-log-id: log-id,
+        is-revoked: false,
+        revocation-log-id: none
+      })
+      
+      (map-set user-consent-count grantee 
+        (+ (default-to u0 (map-get? user-consent-count grantee)) u1))
+      
+      (var-set total-consents (+ (var-get total-consents) u1))
+      (ok true)
+    )
   )
 )
 
@@ -110,16 +226,31 @@
   (let (
     (consent-key { grantor: tx-sender, grantee: grantee, resource-id: resource-id })
     (consent-data (unwrap! (map-get? consents consent-key) ERR_CONSENT_NOT_FOUND))
+    (audit-trail (default-to { creation-log-id: u0, modification-count: u0, last-modification-log-id: u0, is-revoked: false, revocation-log-id: none }
+                  (map-get? consent-audit-trail consent-key)))
   )
     (asserts! (get is-active consent-data) ERR_CONSENT_REVOKED)
     
-    (map-set consents consent-key 
-      (merge consent-data { is-active: false }))
-    
-    (map-set user-consent-count grantee 
-      (- (default-to u1 (map-get? user-consent-count grantee)) u1))
-    
-    (ok true)
+    (let (
+      (log-id (log-audit-event "REVOKE_CONSENT" tx-sender (some grantee) (some resource-id) true 
+                              (concat "Revoked consent for resource: " resource-id)))
+    )
+      (map-set consents consent-key 
+        (merge consent-data { is-active: false }))
+      
+      (map-set consent-audit-trail consent-key
+        (merge audit-trail { 
+          is-revoked: true, 
+          revocation-log-id: (some log-id),
+          modification-count: (+ (get modification-count audit-trail) u1),
+          last-modification-log-id: log-id
+        }))
+      
+      (map-set user-consent-count grantee 
+        (- (default-to u1 (map-get? user-consent-count grantee)) u1))
+      
+      (ok true)
+    )
   )
 )
 
@@ -585,3 +716,98 @@
     false
   )
 )
+
+(define-read-only (get-audit-log (log-id uint))
+  (map-get? audit-logs log-id)
+)
+
+(define-read-only (get-user-audit-logs (user principal))
+  (map-get? user-audit-logs user)
+)
+
+(define-read-only (get-consent-audit-trail 
+  (grantor principal) 
+  (grantee principal) 
+  (resource-id (string-ascii 64)))
+  (map-get? consent-audit-trail { grantor: grantor, grantee: grantee, resource-id: resource-id })
+)
+
+(define-read-only (get-event-type-stats (event-type (string-ascii 32)))
+  (map-get? event-type-stats event-type)
+)
+
+(define-read-only (get-total-audit-logs)
+  (var-get audit-log-counter)
+)
+
+(define-public (query-audit-logs-by-actor 
+  (actor principal) 
+  (limit uint))
+  (let (
+    (user-logs (default-to { log-count: u0, latest-log-id: u0, logs: (list) }
+               (map-get? user-audit-logs actor)))
+    (logs-list (get logs user-logs))
+    (capped-limit (if (> limit u50) u50 limit))
+  )
+    (ok (if (> (len logs-list) capped-limit)
+         (unwrap-panic (slice? logs-list u0 capped-limit))
+         logs-list))
+  )
+)
+
+(define-public (query-audit-logs-by-event-type 
+  (event-type (string-ascii 32)) 
+  (start-log-id uint) 
+  (limit uint))
+  (let (
+    (max-log-id (var-get audit-log-counter))
+    (capped-limit (if (> limit u50) u50 limit))
+    (search-range (if (> (+ start-log-id capped-limit) max-log-id) 
+                    (- max-log-id start-log-id) 
+                    capped-limit))
+  )
+    (ok (filter-logs-by-type event-type start-log-id search-range))
+  )
+)
+
+(define-private (filter-logs-by-type 
+  (target-event-type (string-ascii 32)) 
+  (start-id uint) 
+  (range uint))
+  (let (
+    (end-id (+ start-id range))
+  )
+    (map get-matching-log-id (generate-range start-id end-id))
+  )
+)
+
+(define-private (get-matching-log-id (log-id uint))
+  (match (map-get? audit-logs log-id)
+    log-entry (if (is-eq (get event-type log-entry) "GRANT_CONSENT") 
+                (some log-id) 
+                none)
+    none
+  )
+)
+
+(define-private (generate-range (start uint) (end uint))
+  (let (
+    (range-size (if (> (- end start) u50) u50 (- end start)))
+  )
+    (map + (list u0 u1 u2 u3 u4 u5 u6 u7 u8 u9 u10 u11 u12 u13 u14 u15 u16 u17 u18 u19 u20 u21 u22 u23 u24 u25 u26 u27 u28 u29 u30 u31 u32 u33 u34 u35 u36 u37 u38 u39 u40 u41 u42 u43 u44 u45 u46 u47 u48 u49) 
+         (list start start start start start start start start start start start start start start start start start start start start start start start start start start start start start start start start start start start start start start start start start start start start start start start start start start))
+  )
+)
+
+(define-read-only (get-audit-summary)
+  {
+    total-logs: (var-get audit-log-counter),
+    grant-events: (default-to u0 (get total-events (map-get? event-type-stats "GRANT_CONSENT"))),
+    revoke-events: (default-to u0 (get total-events (map-get? event-type-stats "REVOKE_CONSENT"))),
+    template-events: (default-to u0 (get total-events (map-get? event-type-stats "CREATE_TEMPLATE"))),
+    batch-events: (default-to u0 (get total-events (map-get? event-type-stats "BATCH_GRANT")))
+  }
+)
+
+
+
