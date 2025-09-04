@@ -9,6 +9,10 @@ requirements = []
 path = 'contracts/Consentix.clar'
 clarity_version = 3
 epoch = 3.1
+[contracts.consent-notifications]
+path = 'contracts/consent-notifications.clar'
+clarity_version = 3
+epoch = 3.1
 [repl.analysis]
 passes = ['check_checker']
 
